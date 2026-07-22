@@ -1,4 +1,4 @@
-import base64
+
 import os
 from openai import OpenAI
 import streamlit as st
@@ -7,11 +7,14 @@ from google.genai import types
 from dotenv import load_dotenv
 import chunk
 from database import conn, cursor
-from embedding import generate_embedding
+from embedding import build_retrieval_text, generate_embedding, rerank
 from rag import answer_question
-from vector import  save_vector, search_vector
+from vector import delete_vectors_for_folder, save_vector, search_vector
 from chunking.semantic_chunker import create_semantic_chunk
 from rag import answer_question
+from document_analyzer import get_file_type
+from extractor import extract_text
+from retrieval import keyword_search, hybrid_merged
 
 load_dotenv()
 
@@ -26,66 +29,19 @@ openrouter_client = OpenAI(
     api_key=os.getenv("OpenRouter_API_KEY"),
 )
 
-def transcribe_with_gemini(upload):
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[
-            Prompt,
-            types.Part.from_bytes(
-                data=upload.getvalue(),
-                mime_type=upload.type,
-            ),
-        ],
-    )
-
-    return response.text
-
-def transcribe_with_openrouter(upload):
-    image_b64 = base64.b64encode(upload.getvalue()).decode("utf-8")
-
-    response = openrouter_client.chat.completions.create(
-        model="google/gemma-4-26b-a4b-it:free",   # or another vision model
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": Prompt,
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{upload.type};base64,{image_b64}"
-                        },
-                    },
-                ],
-            }
-        ],
-    )
-
-    return response.choices[0].message.content
 
 
-def transcribe(upload):
-    try:
-        st.info("Using Gemini...")
-        return transcribe_with_gemini(upload)
 
-    except Exception as e:
-        # st.warning(f"Gemini failed: {e}")
-        st.info("Switching to OpenRouter...")
 
-        return transcribe_with_openrouter(upload)
     
 
-def save_chunk(file_id, chunk_index, title, chunk_text):
+def save_chunk(file_id, section,chunk_index, title, chunk_text,keywords):
     cursor.execute(
         """
-        INSERT INTO chunks (file_id, chunk_index, title, chunk_text)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO chunks (file_id, section, chunk_index, title, chunk_text, keywords)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (file_id, chunk_index, title, chunk_text)
+        (file_id, section, chunk_index, title, chunk_text, ",".join(keywords))
     )
 
     # SQLite gives the ID of the row that was just inserted
@@ -142,6 +98,8 @@ selected_folder_id = selected_folder[0]
 
 if st.button("🗑 Delete Folder"):
 
+    delete_vectors_for_folder(selected_folder_id)
+
     cursor.execute(
         """
         DELETE FROM folders
@@ -158,37 +116,24 @@ if st.button("🗑 Delete Folder"):
 
 # upload =st.file_uploader("Upload your image here")
 
-Prompt = ''' You are an expert note formatter.
-
-Extract all text from the image and rewrite it as well-structured Markdown notes.
-
-Requirements:
-- Return ONLY the formatted notes.
-# - Include any introduction, conclusion, explanation, or commentary.
-# - If there are any headings, subheadings, or bullet points in the image, preserve them in the output.
-# - If there are no headings, create appropriate headings based on the content.
-- Do NOT say things like:
-  - "Here's the text from the image..."
-  - "Below are the notes..."
-  - "The image contains..."
-- Start immediately with the first heading or bullet point.
-- Preserve all important information.
-- Use Markdown headings, bullet points, numbered lists, and tables where appropriate.
-- Do not invent information that is not present in the image.
-'''
 
 
 
 
 with st.form("upload_form", clear_on_submit=True):
     upload = st.file_uploader("Upload your image here")
+
+    if upload:
+        file_type = get_file_type(upload.name)
+        
+
     process_upload = st.form_submit_button("Process Upload")
 
 
 if process_upload and upload is not None:
 
     # Send uploaded image to the VLM for note extraction.
-    response = transcribe(upload)
+    response = extract_text(upload, file_type)
 
     # Save the extracted notes into the files table.
     cursor.execute(
@@ -212,19 +157,34 @@ if process_upload and upload is not None:
 
     # Save every chunk into the chunks table.
     for chunk_data in chunks:
-        embedding = generate_embedding(chunk_data["chunk_text"])
+        text_for_embedding = f"""
+        Section: {chunk_data["section"]}
+
+        Title: {chunk_data["title"]}
+
+        Keywords: {", ".join(chunk_data["keywords"])}
+
+        Content:
+        {chunk_data["chunk_text"]}
+            """
+        
+        embedding = generate_embedding(text_for_embedding)
         payload={
             "folder_id": selected_folder_id,
             "file_id": file_id,
+            "section": chunk_data["section"],
             "chunk_index": chunk_data["chunk_index"],
             "title": chunk_data["title"],
             "chunk_text": chunk_data["chunk_text"],
+            "keywords": chunk_data["keywords"],
         }
         chunk_id=save_chunk(
             file_id=file_id,
             chunk_index=chunk_data["chunk_index"],
+            section=chunk_data["section"],
             title=chunk_data["title"],
-            chunk_text=chunk_data["chunk_text"]
+            chunk_text=chunk_data["chunk_text"],
+            keywords=chunk_data["keywords"]
         )
 
         save_vector(
@@ -271,18 +231,19 @@ st.table(rows)
 question=st.text_input("Ask a question about your notes:")
 if question:
     question_embedding=generate_embedding(question)
-    search_results=search_vector(question_embedding, top_k=5)
-    
+    vector_results=search_vector(question_embedding, top_k=20, folder_id=selected_folder_id)
+    keyword_results=keyword_search(question, limit=20, folder_id=selected_folder_id)
+    merged_results=hybrid_merged(vector_results, keyword_results)
+    reranked=rerank(question, merged_results)
+    top_chunks=reranked[:5]
 
     context = ""
 
-    for i, result in enumerate(search_results, start=1):
+    for i, result in enumerate(top_chunks, start=1):
                 context += f"""
                             Chunk {i}
 
-                            Title: {result.payload['title']}
-
-                            {result.payload['chunk_text']}
+                            {build_retrieval_text(result)}
 
                             --------------------------------
                             """
@@ -315,3 +276,24 @@ if question:
 
     answer = answer_question(rag_prompt)
     st.markdown(f"**Answer:** {answer}")
+
+    st.subheader("Retrieved Chunks")
+
+    for i, result in enumerate(top_chunks, start=1):
+        st.write(
+        i,
+        result["rerank_score"],
+        result["section"],
+        result["title"]
+    )
+
+
+    for i, chunk in enumerate(top_chunks, 1):
+        print("=" * 50)
+        print(f"Rank {i}")
+        print(f"Rerank Score: {chunk['rerank_score']:.4f}")
+        print(f"Vector Score: {chunk['score']:.4f}")
+        print(f"CrossEncoder Score: {chunk.get('cross_encoder_score', 0):.4f}")
+        print(f"Metadata Score: {chunk.get('metadata_score', 0):.4f}")
+        print(f"Title: {chunk['title']}")
+        print(f"Section: {chunk['section']}")

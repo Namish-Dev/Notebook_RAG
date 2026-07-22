@@ -40,6 +40,10 @@ CREATE TABLE IF NOT EXISTS chunks (
     title TEXT,
 
     chunk_text TEXT NOT NULL,
+               
+    keywords TEXT,
+               
+    section TEXT,
 
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 
